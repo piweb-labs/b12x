@@ -942,6 +942,7 @@ class B12xMLASparseMetadataBuilder(
 
 class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
     can_return_lse_for_decode: bool = True
+    supports_token_start: bool = True
 
     def __init__(
         self,
@@ -1759,6 +1760,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: B12xMLASparseMetadata,
         layer: AttentionLayer,
+        token_start: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
             ql_nope, q_pe = q
@@ -1769,7 +1771,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         num_actual_toks = q_all.shape[0]
         assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        topk_indices = self.topk_indices_buffer[
+            token_start : token_start + num_actual_toks
+        ]
         if self.dcp_world_size > 1 and self.dcp_topk_per_rank > 0:
             topk_indices = topk_indices[:, : self.dcp_topk_per_rank]
         page_table_1_buffer = attn_metadata.page_table_1[:, : topk_indices.shape[1]]

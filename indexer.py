@@ -151,6 +151,7 @@ def split_indexer_prefill_chunks(
     b12x_tile_k_rows: int = 0,
     b12x_topk_tokens: int = 0,
     max_query_chunk_size: int | None = None,
+    prefer_single_req_max_q_chunk: bool = False,
 ) -> list[tuple[slice, slice]]:
     """
     Split prefill requests into chunks for the sparse indexer, respecting:
@@ -205,13 +206,25 @@ def split_indexer_prefill_chunks(
             end += 1
 
         req_slice = slice(start + request_offset, end + request_offset)
-        max_q = (
-            max(1, max_score_bytes // score_bytes_per_query(chunk_n))
-            if chunk_n > 0
-            else chunk_m
-        )
-        if max_query_chunk_size is not None and max_query_chunk_size > 0:
-            max_q = min(max_q, int(max_query_chunk_size))
+        if (
+            prefer_single_req_max_q_chunk
+            and end - start == 1
+            and max_query_chunk_size is not None
+            and max_query_chunk_size > 0
+        ):
+            # B12X extend workspaces already reserve a graph-stable Q capacity.
+            # For a single long prompt, chunk by that contract-sized Q limit
+            # directly instead of re-imposing the conservative dense/logits
+            # budget, which otherwise over-fragments 128k+ prefills.
+            max_q = int(max_query_chunk_size)
+        else:
+            max_q = (
+                max(1, max_score_bytes // score_bytes_per_query(chunk_n))
+                if chunk_n > 0
+                else chunk_m
+            )
+            if max_query_chunk_size is not None and max_query_chunk_size > 0:
+                max_q = min(max_q, int(max_query_chunk_size))
         for q_off in range(0, chunk_m, max_q):
             sub_m = min(max_q, chunk_m - q_off)
             chunks.append((req_slice, slice(q_off, q_off + sub_m)))
@@ -1028,6 +1041,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 b12x_tile_k_rows=_B12X_PREFILL_TILE_K_ROWS,
                 b12x_topk_tokens=self.index_topk,
                 max_query_chunk_size=max_query_chunk_size,
+                prefer_single_req_max_q_chunk=use_b12x_tiled_topk_budget,
             )
             context_cache: dict[
                 tuple[int, int], tuple[torch.Tensor, torch.Tensor, int | torch.Tensor]

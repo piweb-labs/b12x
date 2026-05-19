@@ -213,6 +213,16 @@ _DEBUG_NSA_INDEXER_MAX = int(os.getenv("VLLM_NSA_INDEXER_DEBUG_MAX", "512"))
 _debug_nsa_indexer_count = 0
 
 
+def _maybe_zero_topk_slice(
+    topk_indices_buffer: torch.Tensor | None,
+    token_start: int,
+    token_end: int,
+) -> None:
+    if topk_indices_buffer is None or token_end <= token_start:
+        return
+    topk_indices_buffer[token_start:token_end].fill_(-1)
+
+
 def _debug_nsa_indexer_prefill(stage: str, chunk, topk_indices: torch.Tensor) -> None:
     if not _DEBUG_NSA_INDEXER:
         return
@@ -1355,6 +1365,325 @@ def sparse_attn_indexer(
                 topk_indices
             )
 
+    return topk_indices_buffer
+
+
+def sparse_attn_indexer_prefill_chunk(
+    hidden_states: torch.Tensor,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    kv_cache: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str,
+    topk_tokens: int,
+    head_dim: int,
+    max_model_len: int,
+    total_seq_lens: int,
+    topk_indices_buffer: torch.Tensor,
+    chunk,
+) -> torch.Tensor:
+    fp8_dtype = current_platform.fp8_dtype()
+    workspace_manager = current_workspace_manager()
+    use_b12x_indexer = _use_b12x_sparse_indexer()
+    b12x_nsa_indexer = None
+    b12x_nsa_api = None
+    if use_b12x_indexer:
+        try:
+            from b12x.attention.nsa_indexer import api as b12x_nsa_api
+            from b12x.integration import nsa_indexer as b12x_nsa_indexer
+        except ImportError:
+            use_b12x_indexer = False
+
+    q_chunk = q_fp8[chunk.token_start:chunk.token_end]
+    weights_chunk = weights[chunk.token_start:chunk.token_end]
+    topk_indices = topk_indices_buffer[chunk.token_start:chunk.token_end, :topk_tokens]
+    _maybe_zero_topk_slice(topk_indices_buffer, chunk.token_start, chunk.token_end)
+
+    tile_logits = lengths = topk_values = None
+    candidate_values = candidate_indices = None
+    b12x_workspace = None
+    b12x_extend_phantoms = None
+    if use_b12x_indexer and b12x_nsa_api is not None:
+        try:
+            b12x_workspace = _get_b12x_indexer_extend_workspace(
+                q_fp8=q_chunk,
+                index_k_cache=kv_cache,
+                topk_tokens=topk_tokens,
+                max_num_reqs=max(int(chunk.num_reqs), 1),
+                max_model_len=max_model_len,
+                total_seq_lens=chunk.total_seq_lens,
+                head_dim=head_dim,
+            )
+            k_fp8, k_scale = b12x_workspace.get_indexer_gather_outputs(
+                row_count=chunk.total_seq_lens
+            )
+            tile_logits = b12x_workspace.get_indexer_extend_tile_logits()
+            lengths = b12x_workspace.get_indexer_extend_lengths(
+                row_count=q_chunk.shape[0]
+            )
+            topk_values, topk_indices_out = (
+                b12x_workspace.get_indexer_extend_topk_buffers(
+                    row_count=q_chunk.shape[0]
+                )
+            )
+            try:
+                b12x_extend_phantoms = (
+                    b12x_workspace.get_indexer_contract_phantoms()
+                )
+            except (AttributeError, RuntimeError):
+                b12x_extend_phantoms = None
+        except (AttributeError, RuntimeError, ValueError):
+            b12x_workspace = None
+            b12x_extend_phantoms = None
+
+    if use_b12x_indexer and b12x_nsa_api is not None:
+        num_chunks = 0
+        if b12x_workspace is None:
+            extra_specs, num_chunks = _b12x_tiled_topk_workspace_specs(
+                api=b12x_nsa_api,
+                q_rows=q_chunk.shape[0],
+                k_rows=chunk.total_seq_lens,
+                num_heads=q_chunk.shape[1],
+                topk=topk_tokens,
+                supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+            )
+            workspace_views = workspace_manager.get_simultaneous(
+                ((chunk.total_seq_lens, head_dim), fp8_dtype),
+                ((chunk.total_seq_lens, 4), torch.uint8),
+                *extra_specs,
+            )
+            k_fp8 = workspace_views[0]
+            k_scale = workspace_views[1]
+            tile_logits = workspace_views[2]
+            lengths = workspace_views[3]
+            topk_values = workspace_views[4]
+            topk_indices_out = topk_indices
+            if num_chunks > 1:
+                candidate_values = workspace_views[5]
+                candidate_indices = workspace_views[6]
+        elif tile_logits is None:
+            extra_specs, num_chunks = _b12x_tiled_topk_workspace_specs(
+                api=b12x_nsa_api,
+                q_rows=q_chunk.shape[0],
+                k_rows=chunk.total_seq_lens,
+                num_heads=q_chunk.shape[1],
+                topk=topk_tokens,
+                supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+                include_outputs=False,
+            )
+            workspace_views = workspace_manager.get_simultaneous(*extra_specs)
+            tile_logits = workspace_views[0]
+            if num_chunks > 1:
+                candidate_values = workspace_views[1]
+                candidate_indices = workspace_views[2]
+            if b12x_extend_phantoms is not None:
+                b12x_extend_phantoms = dict(b12x_extend_phantoms)
+                b12x_extend_phantoms["extend_tile_logits"] = tile_logits
+    else:
+        k_fp8, k_scale = workspace_manager.get_simultaneous(
+            ((total_seq_lens, head_dim), fp8_dtype),
+            ((total_seq_lens, 4), torch.uint8),
+        )
+        k_fp8 = k_fp8[: chunk.total_seq_lens]
+        k_scale = k_scale[: chunk.total_seq_lens]
+        topk_indices_out = topk_indices
+
+    if not chunk.skip_kv_gather:
+        ops.cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            k_fp8,
+            k_scale,
+            chunk.block_table,
+            chunk.cu_seq_lens,
+        )
+
+    k_scale_f32 = k_scale.view(torch.float32).flatten()
+    k_fp8_b12x = (
+        k_fp8.view(torch.float8_e4m3fn) if k_fp8.dtype == torch.uint8 else k_fp8
+    )
+
+    if use_b12x_indexer:
+        assert b12x_nsa_indexer is not None
+        logits = None
+        if not _B12X_EXTEND_TILED_TOPK_UNAVAILABLE:
+            try:
+                topk_indices.copy_(
+                    b12x_nsa_indexer.sparse_nsa_index_extend_tiled_topk(
+                        q_fp8=q_chunk,
+                        weights=weights_chunk,
+                        kv_fp8=(k_fp8_b12x, k_scale_f32),
+                        metadata=b12x_nsa_indexer.NSAIndexerExtendLogitsMetadata(
+                            k_start=chunk.cu_seqlen_ks,
+                            k_end=chunk.cu_seqlen_ke,
+                        ),
+                        topk=topk_tokens,
+                        contract_phantoms=b12x_extend_phantoms,
+                        tile_logits=tile_logits,
+                        lengths=lengths,
+                        output_values=topk_values,
+                        output_indices=topk_indices_out,
+                        candidate_values=candidate_values,
+                        candidate_indices=candidate_indices,
+                        supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+                    )
+                )
+                _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
+                _debug_nsa_indexer_prefill("b12x_extend_tiled_topk", chunk, topk_indices)
+                return topk_indices_buffer
+            except AttributeError:
+                pass
+            except ImportError:
+                pass
+            except ValueError as exc:
+                if not _is_b12x_missing_extend_logits_kernel(exc):
+                    raise
+
+        if not _B12X_EXTEND_LOGITS_UNAVAILABLE:
+            try:
+                logits = b12x_nsa_indexer.sparse_nsa_index_extend_logits(
+                    q_fp8=q_chunk,
+                    weights=weights_chunk,
+                    kv_fp8=(k_fp8_b12x, k_scale_f32),
+                    metadata=b12x_nsa_indexer.NSAIndexerExtendLogitsMetadata(
+                        k_start=chunk.cu_seqlen_ks,
+                        k_end=chunk.cu_seqlen_ke,
+                    ),
+                    contract_phantoms=b12x_extend_phantoms,
+                )
+            except AttributeError:
+                logits = None
+            except ImportError:
+                logits = None
+            except ValueError as exc:
+                if not _is_b12x_missing_extend_logits_kernel(exc):
+                    raise
+                logits = None
+        if logits is None:
+            dense_prefill_max_q = _dense_prefill_max_q_rows(chunk.total_seq_lens)
+            if q_chunk.shape[0] > dense_prefill_max_q:
+                for q_sub_start in range(0, q_chunk.shape[0], dense_prefill_max_q):
+                    q_sub_end = min(q_sub_start + dense_prefill_max_q, q_chunk.shape[0])
+                    sub_logits = fp8_mqa_logits(
+                        q_chunk[q_sub_start:q_sub_end],
+                        (k_fp8, k_scale_f32),
+                        weights_chunk[q_sub_start:q_sub_end],
+                        chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
+                        chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
+                        clean_logits=False,
+                    )
+                    sub_rows = sub_logits.shape[0]
+                    sub_topk = topk_indices[q_sub_start:q_sub_end]
+                    if current_platform.is_xpu():
+                        xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+                            sub_logits,
+                            chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
+                            chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
+                            sub_topk,
+                            sub_rows,
+                            sub_logits.stride(0),
+                            sub_logits.stride(1),
+                            topk_tokens,
+                        )
+                    else:
+                        torch.ops._C.top_k_per_row_prefill(
+                            sub_logits,
+                            chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
+                            chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
+                            sub_topk,
+                            sub_rows,
+                            sub_logits.stride(0),
+                            sub_logits.stride(1),
+                            topk_tokens,
+                        )
+                _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
+                _debug_nsa_indexer_prefill(
+                    "fallback_prefill_topk_subchunked", chunk, topk_indices
+                )
+                return topk_indices_buffer
+            logits = fp8_mqa_logits(
+                q_chunk,
+                (k_fp8, k_scale_f32),
+                weights_chunk,
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
+                clean_logits=False,
+            )
+    else:
+        dense_prefill_max_q = _dense_prefill_max_q_rows(chunk.total_seq_lens)
+        if q_chunk.shape[0] > dense_prefill_max_q:
+            for q_sub_start in range(0, q_chunk.shape[0], dense_prefill_max_q):
+                q_sub_end = min(q_sub_start + dense_prefill_max_q, q_chunk.shape[0])
+                sub_logits = fp8_mqa_logits(
+                    q_chunk[q_sub_start:q_sub_end],
+                    (k_fp8, k_scale_f32),
+                    weights_chunk[q_sub_start:q_sub_end],
+                    chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
+                    chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
+                    clean_logits=False,
+                )
+                sub_rows = sub_logits.shape[0]
+                sub_topk = topk_indices[q_sub_start:q_sub_end]
+                if current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+                        sub_logits,
+                        chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
+                        chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
+                        sub_topk,
+                        sub_rows,
+                        sub_logits.stride(0),
+                        sub_logits.stride(1),
+                        topk_tokens,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_prefill(
+                        sub_logits,
+                        chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
+                        chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
+                        sub_topk,
+                        sub_rows,
+                        sub_logits.stride(0),
+                        sub_logits.stride(1),
+                        topk_tokens,
+                    )
+            _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
+            _debug_nsa_indexer_prefill(
+                "fallback_prefill_topk_subchunked", chunk, topk_indices
+            )
+            return topk_indices_buffer
+        logits = fp8_mqa_logits(
+            q_chunk,
+            (k_fp8, k_scale_f32),
+            weights_chunk,
+            chunk.cu_seqlen_ks,
+            chunk.cu_seqlen_ke,
+            clean_logits=False,
+        )
+
+    num_rows = logits.shape[0]
+    if current_platform.is_xpu():
+        xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+            logits,
+            chunk.cu_seqlen_ks,
+            chunk.cu_seqlen_ke,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+    else:
+        torch.ops._C.top_k_per_row_prefill(
+            logits,
+            chunk.cu_seqlen_ks,
+            chunk.cu_seqlen_ke,
+            topk_indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk_tokens,
+        )
+    _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
+    _debug_nsa_indexer_prefill("fallback_prefill_topk", chunk, topk_indices)
     return topk_indices_buffer
 
 
