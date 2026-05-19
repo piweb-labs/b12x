@@ -1,0 +1,678 @@
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 4963494b2..41cf4c0eb 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -418,6 +418,12 @@ def _b12x_tiled_topk_workspace_specs(
+     return specs, num_chunks
+ 
+ 
++def _dense_prefill_max_q_rows(total_seq_lens: int) -> int:
++    max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++    max_logits_elems = max_logits_bytes // 4
++    return max(1, max_logits_elems // max(int(total_seq_lens), 1))
++
++
+ def _get_b12x_indexer_workspace(
+     *,
+     q_fp8: torch.Tensor,
+@@ -822,14 +828,6 @@ def sparse_attn_indexer(
+                             row_count=q_chunk.shape[0]
+                         )
+                     )
+-                    # #88 (Path D): pull workspace-side phantoms for stable
+-                    # cache keys on the extend (prefill) NSA indexer kernels.
+-                    # These were already allocated by the workspace's
+-                    # `_allocate_contract_phantoms()` at construction time;
+-                    # we just need to thread them into the call site.
+-                    # Eliminates per-batch-shape recompile on the prefill
+-                    # path that was the actual hang in alice's DCP=8 first
+-                    # /v1/completions (#87 fixed only the decode path).
+                     try:
+                         b12x_extend_phantoms = (
+                             b12x_workspace.get_indexer_contract_phantoms()
+@@ -839,7 +837,6 @@ def sparse_attn_indexer(
+                 except (AttributeError, RuntimeError, ValueError):
+                     b12x_workspace = None
+                     b12x_extend_phantoms = None
+-
+             if use_b12x_indexer and b12x_nsa_api is not None:
+                 num_chunks = 0
+                 if b12x_workspace is None:
+@@ -875,7 +872,9 @@ def sparse_attn_indexer(
+                         supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+                         include_outputs=False,
+                     )
+-                    workspace_views = workspace_manager.get_simultaneous(*extra_specs)
++                    workspace_views = workspace_manager.get_simultaneous(
++                        *extra_specs
++                    )
+                     tile_logits = workspace_views[0]
+                     if num_chunks > 1:
+                         candidate_values = workspace_views[1]
+@@ -930,13 +929,14 @@ def sparse_attn_indexer(
+                                 supertile_k=_B12X_EXTEND_TOPK_SUPERTILE_K,
+                             )
+                         )
+-                        _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
++                        _normalize_prefill_topk_to_req_relative(
++                            chunk, topk_indices
++                        )
+                         _debug_nsa_indexer_prefill(
+                             "b12x_extend_tiled_topk", chunk, topk_indices
+                         )
+                         continue
+                     except AttributeError:
+-                        # Older b12x builds expose only the dense-logits path.
+                         _B12X_EXTEND_TILED_TOPK_UNAVAILABLE = True
+                     except ImportError:
+                         _B12X_EXTEND_TILED_TOPK_UNAVAILABLE = True
+@@ -995,6 +995,51 @@ def sparse_attn_indexer(
+                         _B12X_EXTEND_LOGITS_UNAVAILABLE = True
+ 
+                 if logits is None:
++                    dense_prefill_max_q = _dense_prefill_max_q_rows(
++                        chunk.total_seq_lens
++                    )
++                    if q_chunk.shape[0] > dense_prefill_max_q:
++                        for q_sub_start in range(0, q_chunk.shape[0], dense_prefill_max_q):
++                            q_sub_end = min(
++                                q_sub_start + dense_prefill_max_q, q_chunk.shape[0]
++                            )
++                            sub_logits = fp8_mqa_logits(
++                                q_chunk[q_sub_start:q_sub_end],
++                                (k_fp8, k_scale_f32),
++                                weights_chunk[q_sub_start:q_sub_end],
++                                chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
++                                chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
++                                clean_logits=False,
++                            )
++                            sub_rows = sub_logits.shape[0]
++                            sub_topk = topk_indices[q_sub_start:q_sub_end]
++                            if current_platform.is_xpu():
++                                xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
++                                    sub_logits,
++                                    chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
++                                    chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
++                                    sub_topk,
++                                    sub_rows,
++                                    sub_logits.stride(0),
++                                    sub_logits.stride(1),
++                                    topk_tokens,
++                                )
++                            else:
++                                torch.ops._C.top_k_per_row_prefill(
++                                    sub_logits,
++                                    chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
++                                    chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
++                                    sub_topk,
++                                    sub_rows,
++                                    sub_logits.stride(0),
++                                    sub_logits.stride(1),
++                                    topk_tokens,
++                                )
++                        _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
++                        _debug_nsa_indexer_prefill(
++                            "fallback_prefill_topk_subchunked", chunk, topk_indices
++                        )
++                        continue
+                     logits = fp8_mqa_logits(
+                         q_chunk,
+                         (k_fp8, k_scale_f32),
+@@ -1004,6 +1049,49 @@ def sparse_attn_indexer(
+                         clean_logits=False,
+                     )
+             else:
++                dense_prefill_max_q = _dense_prefill_max_q_rows(chunk.total_seq_lens)
++                if q_chunk.shape[0] > dense_prefill_max_q:
++                    for q_sub_start in range(0, q_chunk.shape[0], dense_prefill_max_q):
++                        q_sub_end = min(
++                            q_sub_start + dense_prefill_max_q, q_chunk.shape[0]
++                        )
++                        sub_logits = fp8_mqa_logits(
++                            q_chunk[q_sub_start:q_sub_end],
++                            (k_fp8, k_scale_f32),
++                            weights_chunk[q_sub_start:q_sub_end],
++                            chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
++                            chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
++                            clean_logits=False,
++                        )
++                        sub_rows = sub_logits.shape[0]
++                        sub_topk = topk_indices[q_sub_start:q_sub_end]
++                        if current_platform.is_xpu():
++                            xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
++                                sub_logits,
++                                chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
++                                chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
++                                sub_topk,
++                                sub_rows,
++                                sub_logits.stride(0),
++                                sub_logits.stride(1),
++                                topk_tokens,
++                            )
++                        else:
++                            torch.ops._C.top_k_per_row_prefill(
++                                sub_logits,
++                                chunk.cu_seqlen_ks[q_sub_start:q_sub_end],
++                                chunk.cu_seqlen_ke[q_sub_start:q_sub_end],
++                                sub_topk,
++                                sub_rows,
++                                sub_logits.stride(0),
++                                sub_logits.stride(1),
++                                topk_tokens,
++                            )
++                    _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
++                    _debug_nsa_indexer_prefill(
++                        "fallback_prefill_topk_subchunked", chunk, topk_indices
++                    )
++                    continue
+                 logits = fp8_mqa_logits(
+                     q_chunk,
+                     (k_fp8, k_scale_f32),
+@@ -1041,7 +1129,9 @@ def sparse_attn_indexer(
+                     topk_tokens,
+                 )
+             _normalize_prefill_topk_to_req_relative(chunk, topk_indices)
+-            _debug_nsa_indexer_prefill("fallback_prefill_topk", chunk, topk_indices)
++            _debug_nsa_indexer_prefill(
++                "fallback_prefill_topk", chunk, topk_indices
++            )
+ 
+     if has_decode:
+         decode_metadata = attn_metadata_narrowed.decode
+@@ -1163,6 +1253,18 @@ def sparse_attn_indexer(
+                 max_model_len=max_model_len,
+                 clean_logits=False,
+             )
++        # NaN defense: fp8/bf16 numerics in {sparse_nsa_index_decode_logits_paged,
++        # fp8_paged_mqa_logits} can produce NaN under degenerate inputs (RMSNorm
++        # near-zero variance, MoE expert with all-zero weights, Sinkhorn
++        # underflow upstream in MTP head). CUDA topk treats NaN as ">= any
++        # value", so a single NaN inside the seq_len region selects garbage
++        # logical positions; the downstream physical_token_table gather then
++        # fans the bad index into block_table OOB and crashes IndexKernel.
++        # Replacing NaN with -inf forces topk to skip; +inf is left alone (it
++        # can legitimately mean "must attend"). One pass per decode step is
++        # cheap relative to the 78-layer cost.
++        if logits.is_floating_point():
++            logits = torch.nan_to_num(logits, nan=float("-inf"))
+         num_rows = logits.shape[0]
+         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+ 
+diff --git a/vllm/v1/attention/backends/mla/b12x_mla_sparse.py b/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+index 86699ce1b..b38216e8e 100644
+--- a/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+@@ -74,10 +74,11 @@ from vllm.v1.attention.backend import (
+     SparseMLAAttentionImpl,
+ )
+ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+-from vllm.v1.attention.backends.mla.sparse_utils import (
+-    triton_convert_req_index_to_global_index,
++from vllm.v1.attention.backends.mla.indexer import (
++    _expand_block_table_to_page_table_1_kernel,
+ )
+ from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.worker.cp_utils import get_total_cp_world_size
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if TYPE_CHECKING:
+@@ -395,6 +396,165 @@ def _compact_page_table_valid_prefix(
+     )
+ 
+ 
++@triton.jit
++def _gather_physical_from_logical_kernel(
++    physical_table_ptr,
++    req_id_ptr,
++    topk_idx_ptr,
++    out_ptr,
++    phys_table_stride0,
++    phys_table_stride1,
++    topk_stride0,
++    out_stride0,
++    out_stride1,
++    page_width: tl.constexpr,
++    topk: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    row = tl.program_id(0)
++    tile = tl.program_id(1)
++    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
++    mask = offs < topk
++
++    req = tl.load(req_id_ptr + row)
++    topk_idx = tl.load(topk_idx_ptr + row * topk_stride0 + offs, mask=mask, other=-1)
++    valid = (topk_idx >= 0) & (topk_idx < page_width)
++    safe_idx = tl.where(valid, topk_idx, 0)
++    physical = tl.load(
++        physical_table_ptr + req * phys_table_stride0 + safe_idx * phys_table_stride1,
++        mask=mask & valid,
++        other=-1,
++    )
++    physical = tl.where(valid, physical, -1)
++    tl.store(out_ptr + row * out_stride0 + offs * out_stride1, physical, mask=mask)
++
++
++@triton.jit
++def _gather_physical_from_logical_compact_kernel(
++    physical_table_ptr,
++    req_id_ptr,
++    topk_idx_ptr,
++    out_ptr,
++    nsa_len_ptr,
++    phys_table_stride0,
++    phys_table_stride1,
++    topk_stride0,
++    out_stride0,
++    out_stride1,
++    page_width: tl.constexpr,
++    topk: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    row = tl.program_id(0)
++    offs = tl.arange(0, BLOCK_N)
++    mask = offs < topk
++
++    req = tl.load(req_id_ptr + row)
++    topk_idx = tl.load(topk_idx_ptr + row * topk_stride0 + offs, mask=mask, other=-1)
++    logical_valid = mask & (topk_idx >= 0) & (topk_idx < page_width)
++    safe_idx = tl.where(logical_valid, topk_idx, 0)
++    physical = tl.load(
++        physical_table_ptr + req * phys_table_stride0 + safe_idx * phys_table_stride1,
++        mask=logical_valid,
++        other=-1,
++    )
++    is_valid = logical_valid & (physical >= 0)
++    physical = tl.where(is_valid, physical, -1)
++    compact_pos = tl.cumsum(is_valid.to(tl.int32), 0) - 1
++    valid_count = tl.sum(is_valid.to(tl.int32), axis=0)
++    row_base = out_ptr + row * out_stride0
++    tl.store(row_base + compact_pos * out_stride1, physical, mask=is_valid)
++    tl.store(
++        row_base + offs * out_stride1,
++        -1,
++        mask=mask & (offs >= valid_count),
++    )
++    tl.store(nsa_len_ptr + row, valid_count)
++
++
++def _gather_physical_from_logical(
++    physical_table: torch.Tensor,
++    req_id_per_token: torch.Tensor,
++    topk_indices: torch.Tensor,
++    out: torch.Tensor,
++) -> torch.Tensor:
++    """Per-token logical→physical NSA index gather.
++
++    For each (token, topk_col): out[t, k] = physical_table[req_id_per_token[t],
++    topk_indices[t, k]] when topk_indices[t, k] is a valid logical position;
++    -1 otherwise (mirrors the -1 sentinel produced by
++    `_expand_block_table_to_page_table_1_kernel` for unallocated slots).
++    """
++    num_tokens, topk = topk_indices.shape
++    if num_tokens == 0 or topk == 0:
++        return out
++    page_width = physical_table.shape[1]
++    BLOCK_N = min(triton.next_power_of_2(max(topk, 1)), 1024)
++    _gather_physical_from_logical_kernel[(num_tokens, triton.cdiv(topk, BLOCK_N))](
++        physical_table,
++        req_id_per_token,
++        topk_indices,
++        out,
++        physical_table.stride(0),
++        physical_table.stride(1),
++        topk_indices.stride(0),
++        out.stride(0),
++        out.stride(1),
++        page_width,
++        topk,
++        BLOCK_N=BLOCK_N,
++    )
++    return out
++
++
++def _gather_physical_from_logical_compact(
++    physical_table: torch.Tensor,
++    req_id_per_token: torch.Tensor,
++    topk_indices: torch.Tensor,
++    out: torch.Tensor,
++    nsa_cache_seqlens: torch.Tensor,
++) -> torch.Tensor:
++    """Gather logical NSA selections and compact valid physical rows in one pass.
++
++    This is the default prefill path for B12X sparse MLA: B12X consumes
++    `page_table_1` as a dense valid prefix, so fusing the logical->physical
++    gather with valid-prefix compaction avoids a second full-row scan.
++    """
++    num_tokens, topk = topk_indices.shape
++    if num_tokens == 0 or topk == 0:
++        return out
++    if topk > 2048:
++        # The fused row kernel assumes one Triton program can cover the full
++        # top-k width. Fall back to the two-pass path for unusually wide top-k.
++        out = _gather_physical_from_logical(
++            physical_table,
++            req_id_per_token,
++            topk_indices,
++            out,
++        )
++        _compact_page_table_valid_prefix(out, nsa_cache_seqlens)
++        return out
++
++    page_width = physical_table.shape[1]
++    BLOCK_N = triton.next_power_of_2(max(topk, 1))
++    _gather_physical_from_logical_compact_kernel[(num_tokens,)](
++        physical_table,
++        req_id_per_token,
++        topk_indices,
++        out,
++        nsa_cache_seqlens,
++        physical_table.stride(0),
++        physical_table.stride(1),
++        topk_indices.stride(0),
++        out.stride(0),
++        out.stride(1),
++        page_width,
++        topk,
++        BLOCK_N=BLOCK_N,
++    )
++    return out
++
++
+ B12X_WORKSPACES: dict[tuple[object, ...], object] = {}
+ B12X_ARENAS: dict[tuple[object, ...], object] = {}
+ _JOINT_ARENA_WARNED = False
+@@ -537,6 +697,12 @@ class B12xMLASparseMetadata(AttentionMetadata):
+     nsa_cu_seqlens_k: torch.Tensor
+     block_size: int
+     topk_tokens: int
++    # Pre-expanded [max_seqs, page_width] table where
++    # physical_token_table[r, p] = block_table[r, p // block_size] * block_size
++    #                              + (p % block_size), or -1 for unallocated p.
++    # Built once per step in build(); per-layer forward only does a gather.
++    physical_token_table: torch.Tensor | None = None
++    physical_token_table_width: int = 0
+ 
+ 
+ class B12xMLASparseMetadataBuilder(
+@@ -603,6 +769,22 @@ class B12xMLASparseMetadataBuilder(
+             (max_tokens + 1,), dtype=torch.int32, device=device
+         )
+ 
++        # Pre-expanded [num_reqs, page_width] physical_token_id table.
++        # page_width = max_num_blocks_per_req * block_size, where
++        # max_num_blocks_per_req covers max_model_len with current CP world.
++        # Per-step build() writes the live rows; per-layer forward gathers.
++        block_size = self.kv_cache_spec.block_size
++        max_num_blocks_per_req = triton.cdiv(
++            vllm_config.model_config.max_model_len,
++            block_size * get_total_cp_world_size(),
++        )
++        self._physical_table_page_width = max_num_blocks_per_req * block_size
++        self.physical_token_table_buffer = torch.empty(
++            (max_seqs, self._physical_table_page_width),
++            dtype=torch.int32,
++            device=device,
++        )
++
+     def build(
+         self,
+         common_prefix_len: int,
+@@ -702,6 +884,42 @@ class B12xMLASparseMetadataBuilder(
+                 seq_lens_for_req[: cm.num_reqs], non_blocking=True
+             )
+ 
++        # Pre-expand block_table → physical_token_id table once per step.
++        # Per-layer forward will gather from this in O(num_tokens * topk)
++        # instead of running triton_convert_req_index_to_global_index over
++        # block_table on every layer. Positions past a req's allocated
++        # blocks land on -1 (sentinel from
++        # _expand_block_table_to_page_table_1_kernel), which the existing
++        # `page_table_1 >= 0` valid-mask logic already handles downstream.
++        physical_token_table = self.physical_token_table_buffer[: cm.num_reqs]
++        block_table = cm.block_table_tensor
++        block_size = self.kv_cache_spec.block_size
++        if cm.num_reqs > 0 and block_table.dim() == 2 and block_table.shape[1] > 0:
++            _pdl_kwargs = (
++                {"USE_GDC": True, "launch_pdl": True}
++                if (
++                    current_platform.is_cuda()
++                    and current_platform.has_device_capability(90)
++                )
++                else {}
++            )
++            _expand_block_table_to_page_table_1_kernel[
++                (
++                    cm.num_reqs,
++                    triton.cdiv(self._physical_table_page_width, 256),
++                )
++            ](
++                block_table,
++                physical_token_table,
++                block_table.stride(0),
++                physical_token_table.stride(0),
++                block_table.shape[1],
++                self._physical_table_page_width,
++                block_size,
++                BLOCK_N=256,
++                **_pdl_kwargs,
++            )
++
+         return B12xMLASparseMetadata(
+             num_reqs=cm.num_reqs,
+             max_query_len=cm.max_query_len,
+@@ -717,6 +935,8 @@ class B12xMLASparseMetadataBuilder(
+             nsa_cu_seqlens_k=self.nsa_cu_seqlens_k_buffer[: num_tokens + 1],
+             block_size=self.kv_cache_spec.block_size,
+             topk_tokens=self.topk_tokens,
++            physical_token_table=physical_token_table,
++            physical_token_table_width=self._physical_table_page_width,
+         )
+ 
+ 
+@@ -1568,14 +1788,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
+                 out=nsa_cache_seqlens,
+             )
+         elif decode_fast_nsa_seqlens:
+-            page_table_1 = triton_convert_req_index_to_global_index(
++            assert attn_metadata.physical_token_table is not None
++            page_table_1 = _gather_physical_from_logical(
++                attn_metadata.physical_token_table,
+                 attn_metadata.req_id_per_token,
+-                attn_metadata.block_table,
+                 topk_indices,
+-                BLOCK_SIZE=attn_metadata.block_size,
+-                NUM_TOPK_TOKENS=topk_indices.shape[1],
+-                return_valid_counts=False,
+-                out=page_table_1_buffer,
++                page_table_1_buffer,
+             )
+             nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[
+                 : attn_metadata.cache_seq_lens_per_req.shape[0]
+@@ -1586,35 +1804,37 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
+                 out=nsa_cache_seqlens,
+             )
+         else:
++            assert attn_metadata.physical_token_table is not None
+             compacted_page_table = self.compact_nsa_page_table
++            nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[
++                : page_table_1_buffer.shape[0]
++            ]
+             if compacted_page_table:
+-                page_table_1 = triton_convert_req_index_to_global_index(
++                page_table_1 = _gather_physical_from_logical_compact(
++                    attn_metadata.physical_token_table,
+                     attn_metadata.req_id_per_token,
+-                    attn_metadata.block_table,
+                     topk_indices,
+-                    BLOCK_SIZE=attn_metadata.block_size,
+-                    NUM_TOPK_TOKENS=topk_indices.shape[1],
+-                    return_valid_counts=False,
+-                    out=page_table_1_buffer,
++                    page_table_1_buffer,
++                    nsa_cache_seqlens,
+                 )
+-                nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[
+-                    : page_table_1.shape[0]
+-                ]
+             else:
+-                page_table_1, nsa_cache_seqlens = (
+-                    triton_convert_req_index_to_global_index(
+-                        attn_metadata.req_id_per_token,
+-                        attn_metadata.block_table,
+-                        topk_indices,
+-                        BLOCK_SIZE=attn_metadata.block_size,
+-                        NUM_TOPK_TOKENS=topk_indices.shape[1],
+-                        return_valid_counts=True,
+-                        out=page_table_1_buffer,
+-                        valid_counts=attn_metadata.nsa_cache_seqlens,
+-                    )
++                page_table_1 = _gather_physical_from_logical(
++                    attn_metadata.physical_token_table,
++                    attn_metadata.req_id_per_token,
++                    topk_indices,
++                    page_table_1_buffer,
++                )
++                # valid_counts was an output of the old triton_convert; recompute
++                # here as a single reduction. Step 6 (fused kernel) will fold
++                # this back into _gather_physical_from_logical_kernel.
++                torch.sum(
++                    (page_table_1 >= 0).to(torch.int32),
++                    dim=1,
++                    out=nsa_cache_seqlens,
+                 )
+             if compacted_page_table:
+-                _compact_page_table_valid_prefix(page_table_1, nsa_cache_seqlens)
++                # Fused gather already writes a dense valid prefix and count.
++                compacted_page_table = True
+ 
+         if self.clamp_nsa_to_valid_prefix:
+             valid_mask = page_table_1 >= 0
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 6c4c0db38..62c2af9de 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -49,6 +49,15 @@ _DEBUG_INDEXER_BLOCK_WIDTH_MAX = int(
+ _DCP_FULL_INDEXER_STATIC_BLOCK_TABLE_MODE = (
+     os.getenv("VLLM_DCP_FULL_INDEXER_STATIC_BLOCK_TABLE", "auto").strip().lower()
+ )
++_B12X_PREFILL_TILE_K_ROWS = int(
++    os.getenv(
++        "VLLM_B12X_NSA_EXTEND_TOPK_SUPERTILE_K",
++        os.getenv("B12X_NSA_EXTEND_TOPK_SUPERTILE_K", "32768"),
++    )
++)
++_B12X_PREFILL_MAX_Q_ROWS = int(
++    os.getenv("VLLM_B12X_INDEXER_EXTEND_MAX_Q", "8192")
++)
+ 
+ 
+ @triton.jit
+@@ -137,20 +146,41 @@ def split_indexer_prefill_chunks(
+     workspace_size: int,
+     max_logits_bytes: int,
+     request_offset: int = 0,
++    *,
++    use_b12x_tiled_topk_budget: bool = False,
++    b12x_tile_k_rows: int = 0,
++    b12x_topk_tokens: int = 0,
++    max_query_chunk_size: int | None = None,
+ ) -> list[tuple[slice, slice]]:
+     """
+     Split prefill requests into chunks for the sparse indexer, respecting:
+     - N constraint: total_seq_lens <= workspace_size (existing O(N) workspace)
+-    - Logits constraint: M * N * 4 <= max_logits_bytes
++    - Score scratch constraint <= max_logits_bytes
+ 
+     When a single request-level chunk still exceeds the logits budget,
+     sub-chunks on the query dimension (M) to bound peak memory.
+ 
+     Returns list of (req_slice, query_slice) tuples.
+     """
++
++    def score_bytes_per_query(total_seq_lens: int) -> int:
++        total_seq_lens = max(int(total_seq_lens), 1)
++        if (
++            use_b12x_tiled_topk_budget
++            and b12x_tile_k_rows > 0
++            and b12x_topk_tokens > 0
++        ):
++            live_tile_k_rows = min(total_seq_lens, int(b12x_tile_k_rows))
++            bytes_per_query = live_tile_k_rows * 4
++            if total_seq_lens > live_tile_k_rows:
++                num_k_chunks = cdiv(total_seq_lens, live_tile_k_rows)
++                bytes_per_query += num_k_chunks * int(b12x_topk_tokens) * 8
++            return bytes_per_query
++        return total_seq_lens * 4
++
+     chunks: list[tuple[slice, slice]] = []
+     n = len(seq_lens_cpu)
+-    max_logits_elems = max_logits_bytes // 4
++    max_score_bytes = max(int(max_logits_bytes), 4)
+     end = 0
+ 
+     while end < n:
+@@ -159,7 +189,10 @@ def split_indexer_prefill_chunks(
+         while end < n:
+             q, s = query_lens_cpu[end].item(), seq_lens_cpu[end].item()
+             new_m, new_n = chunk_m + q, chunk_n + s
+-            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
++            if (
++                new_n <= workspace_size
++                and new_m * score_bytes_per_query(new_n) <= max_score_bytes
++            ):
+                 chunk_m, chunk_n = new_m, new_n
+                 end += 1
+             else:
+@@ -172,7 +205,13 @@ def split_indexer_prefill_chunks(
+             end += 1
+ 
+         req_slice = slice(start + request_offset, end + request_offset)
+-        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
++        max_q = (
++            max(1, max_score_bytes // score_bytes_per_query(chunk_n))
++            if chunk_n > 0
++            else chunk_m
++        )
++        if max_query_chunk_size is not None and max_query_chunk_size > 0:
++            max_q = min(max_q, int(max_query_chunk_size))
+         for q_off in range(0, chunk_m, max_q):
+             sub_m = min(max_q, chunk_m - q_off)
+             chunks.append((req_slice, slice(q_off, q_off + sub_m)))
+@@ -180,6 +219,13 @@ def split_indexer_prefill_chunks(
+     return chunks
+ 
+ 
++def _use_b12x_prefill_tiled_chunking() -> bool:
++    return current_platform.is_cuda() and (
++        envs.VLLM_USE_B12X_SPARSE_INDEXER
++        or envs.VLLM_USE_B12XF_SPARSE_INDEXER
++    )
++
++
+ class DeepseekV32IndexerBackend(AttentionBackend):
+     @staticmethod
+     def get_name() -> str:
+@@ -966,12 +1012,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 else global_seq_lens_cpu
+             )
+             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++            use_b12x_tiled_topk_budget = _use_b12x_prefill_tiled_chunking()
++            max_query_chunk_size = (
++                max(_B12X_PREFILL_MAX_Q_ROWS, 1)
++                if use_b12x_tiled_topk_budget
++                else None
++            )
+             chunk_specs = split_indexer_prefill_chunks(
+                 indexer_seq_lens_cpu[num_decodes:],
+                 prefill_query_lens_cpu,
+                 self.max_prefill_buffer_size,
+                 max_logits_bytes,
+                 request_offset=num_decodes,
++                use_b12x_tiled_topk_budget=use_b12x_tiled_topk_budget,
++                b12x_tile_k_rows=_B12X_PREFILL_TILE_K_ROWS,
++                b12x_topk_tokens=self.index_topk,
++                max_query_chunk_size=max_query_chunk_size,
+             )
+             context_cache: dict[
+                 tuple[int, int], tuple[torch.Tensor, torch.Tensor, int | torch.Tensor]
